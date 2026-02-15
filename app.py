@@ -20,14 +20,13 @@ BATCH_SIZE = 25  # GraphQL aliases per request (safe + simple)
 # -----------------------------
 # GitHub API helpers
 # -----------------------------
-def gh_headers() -> Dict[str, str]:
-    token = os.getenv("GITHUB_TOKEN", "").strip()
+def gh_headers(token: str) -> Dict[str, str]:
     headers = {
         "Accept": "application/vnd.github+json",
         "User-Agent": "impact-dashboard-streamlit",
     }
     if token:
-        headers["Authorization"] = f"Bearer {token}"
+        headers["Authorization"] = f"Bearer {token}"  # capital B required by GitHub
     return headers
 
 
@@ -35,20 +34,48 @@ def sleep_backoff(attempt: int) -> None:
     time.sleep(min(30, 2 ** attempt))
 
 
-def rest_get(url: str, params: Dict[str, Any] | None = None) -> Dict[str, Any]:
-    headers = gh_headers()
+def rest_get(url: str, token: str, params: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    headers = gh_headers(token)
+
     for attempt in range(4):
         r = requests.get(url, headers=headers, params=params, timeout=30)
-        if r.status_code in (429, 403) and "rate limit" in r.text.lower():
-            sleep_backoff(attempt)
-            continue
+
+        # If it's a rate limit / secondary rate limit, backoff then retry
+        if r.status_code in (403, 429):
+            txt = (r.text or "").lower()
+            is_rl = "rate limit" in txt or "secondary rate limit" in txt
+
+            if is_rl and attempt < 3:
+                sleep_backoff(attempt)
+                continue
+
+            # otherwise, raise a helpful error with headers
+            rem = r.headers.get("X-RateLimit-Remaining")
+            reset = r.headers.get("X-RateLimit-Reset")
+            used = r.headers.get("X-RateLimit-Used")
+            msg = ""
+            try:
+                msg = r.json().get("message", "")
+            except Exception:
+                msg = r.text[:200]
+
+            raise RuntimeError(
+                f"REST {r.status_code}. message={msg} remaining={rem} used={used} reset={reset} token_present={bool(token)}"
+            )
+
         r.raise_for_status()
         return r.json()
+
     r.raise_for_status()
 
 
-def graphql(query: str, variables: Dict[str, Any]) -> Dict[str, Any]:
-    headers = gh_headers()
+def get_core_remaining(token: str) -> int:
+    data = rest_get("https://api.github.com/rate_limit", token=token)
+    return int(data["resources"]["core"]["remaining"])
+
+
+def graphql(query: str, variables: Dict[str, Any], token: str) -> Dict[str, Any]:
+    headers = gh_headers(token)
     url = "https://api.github.com/graphql"
     for attempt in range(4):
         r = requests.post(url, headers=headers, json={"query": query, "variables": variables}, timeout=30)
@@ -60,13 +87,20 @@ def graphql(query: str, variables: Dict[str, Any]) -> Dict[str, Any]:
         if "errors" in data:
             raise RuntimeError(data["errors"])
         return data
+    if r.status_code == 403:
+        raise RuntimeError(f"GitHub GraphQL 403: {r.text[:400]}")
     r.raise_for_status()
+
+
+def graphql_rate_limit(token: str) -> Dict[str, Any]:
+    q = "query { rateLimit { remaining resetAt cost } }"
+    return graphql(q, {}, token=token)["data"]["rateLimit"]
 
 
 # -----------------------------
 # Data fetch (bounded + PR-only)
 # -----------------------------
-def search_merged_pr_numbers(days: int, cap: int) -> List[int]:
+def search_merged_pr_numbers(days: int, cap: int, token: str) -> List[int]:
     since = (dt.date.today() - dt.timedelta(days=days)).isoformat()
     q = f"is:pr repo:{FULL_REPO} is:merged merged:>={since}"
     url = "https://api.github.com/search/issues"
@@ -76,6 +110,7 @@ def search_merged_pr_numbers(days: int, cap: int) -> List[int]:
     while len(nums) < cap:
         data = rest_get(
             url,
+            token=token,
             params={"q": q, "sort": "updated", "order": "desc", "per_page": 100, "page": page},
         )
         items = data.get("items", [])
@@ -87,7 +122,53 @@ def search_merged_pr_numbers(days: int, cap: int) -> List[int]:
     return nums[:cap]
 
 
-def fetch_pr_batch(pr_numbers: List[int]) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+def fetch_recent_merged_prs_rest(days: int, cap: int, token: str) -> List[Dict[str, Any]]:
+    """Cheap REST fallback: list /pulls (up to 10 pages) to collect enough merged PRs."""
+    cutoff = dt.datetime.utcnow() - dt.timedelta(days=days)
+    prs: List[Dict[str, Any]] = []
+    page = 1
+
+    while len(prs) < cap and page <= 10:  # more pages so we get enough merged PRs
+        items = rest_get(
+            f"https://api.github.com/repos/{FULL_REPO}/pulls",
+            token=token,
+            params={"state": "closed", "sort": "created", "direction": "desc", "per_page": 100, "page": page},
+        )
+
+        if not items:
+            break
+
+        for pr in items:
+            if not pr.get("merged_at"):
+                continue
+            merged_at = pd.to_datetime(pr["merged_at"], utc=True)
+            if merged_at.to_pydatetime().replace(tzinfo=None) < cutoff:
+                continue
+
+            prs.append(
+                {
+                    "number": pr.get("number"),
+                    "url": pr.get("html_url"),
+                    "title": pr.get("title"),
+                    "author": {"login": (pr.get("user") or {}).get("login")},
+                    "createdAt": pr.get("created_at"),
+                    "mergedAt": pr.get("merged_at"),
+                    "additions": 0,
+                    "deletions": 0,
+                    "changedFiles": 0,
+                    "reviews": {"nodes": []},
+                }
+            )
+
+            if len(prs) >= cap:
+                break
+
+        page += 1
+
+    return prs
+
+
+def fetch_pr_batch(pr_numbers: List[int], token: str) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     # PR-only fields (no issue events, no status checks)
     pr_fields = """
       number
@@ -115,7 +196,7 @@ def fetch_pr_batch(pr_numbers: List[int]) -> Tuple[Dict[str, Any], List[Dict[str
     }}
     """
 
-    data = graphql(query, {"owner": OWNER, "name": REPO})
+    data = graphql(query, {"owner": OWNER, "name": REPO}, token=token)
     rl = data["data"]["rateLimit"]
     repo = data["data"]["repository"]
 
@@ -127,16 +208,31 @@ def fetch_pr_batch(pr_numbers: List[int]) -> Tuple[Dict[str, Any], List[Dict[str
     return rl, prs
 
 
-def fetch_pr_details(pr_numbers: List[int]) -> List[Dict[str, Any]]:
-    all_prs: List[Dict[str, Any]] = []
-    for i in range(0, len(pr_numbers), BATCH_SIZE):
-        chunk = pr_numbers[i : i + BATCH_SIZE]
-        rl, prs = fetch_pr_batch(chunk)
-        all_prs.extend(prs)
+def fetch_pr_details(pr_numbers: List[int], token: str, token_present: bool) -> List[Dict[str, Any]]:
+    if not token_present:
+        return []
 
-        # be rate-limit aware; stop early rather than sleeping forever
-        if rl.get("remaining", 0) < 200:
+    all_prs: List[Dict[str, Any]] = []
+    i = 0
+    remaining = 5000  # optimistic start; updated from rl2 after each batch
+
+    while i < len(pr_numbers):
+        if remaining < 200:
             break
+
+        batch = 25 if remaining > 1000 else 10 if remaining > 400 else 5
+        chunk = pr_numbers[i : i + batch]
+
+        try:
+            rl2, prs = fetch_pr_batch(chunk, token=token)
+            remaining = rl2.get("remaining", remaining)
+            all_prs.extend(prs)
+        except Exception as e:
+            if "rate limit" in str(e).lower() or "secondary" in str(e).lower():
+                break
+            raise
+
+        i += batch
 
     return all_prs
 
@@ -170,6 +266,7 @@ def build_pr_df(prs: List[Dict[str, Any]]) -> pd.DataFrame:
         merge_hours = None
         if pd.notna(created_at) and pd.notna(merged_at):
             merge_hours = (merged_at - created_at).total_seconds() / 3600.0
+            merge_hours = min(merge_hours, 24 * 14)  # cap at 2 weeks
 
         additions = pr.get("additions", 0) or 0
         deletions = pr.get("deletions", 0) or 0
@@ -217,8 +314,10 @@ def compute_engineer_df(pr_df: pd.DataFrame) -> pd.DataFrame:
 
     # Review contribution: count reviews WRITTEN by each reviewer across all PRs
     # explode review authors
-    exploded = df[["review_authors"]].explode("review_authors").dropna()
-    exploded = exploded[exploded["review_authors"] != "unknown"]  # defensive
+    exploded = df[["number", "review_authors"]].explode("review_authors").dropna()
+    exploded = exploded[exploded["review_authors"] != "unknown"]
+    exploded = exploded[~exploded["review_authors"].astype(str).str.endswith("[bot]")]
+    exploded = exploded.drop_duplicates(subset=["number", "review_authors"])
     if len(exploded) == 0:
         review_counts = pd.DataFrame({"author": [], "reviews_written": []})
     else:
@@ -279,15 +378,36 @@ def apply_weights(eng: pd.DataFrame, w: Dict[str, float], include_leverage: bool
 
 
 # -----------------------------
-# Cached load
+# Load (cached only for limited mode so token changes don't hit stale cache)
 # -----------------------------
-@st.cache_data(show_spinner=False, ttl=60 * 30)
-def load(days: int, cap_prs: int) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    pr_numbers = search_merged_pr_numbers(days=days, cap=cap_prs)
-    prs = fetch_pr_details(pr_numbers)
+def _load(
+    days: int, cap_prs: int, token: str, token_present: bool
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    if token_present:
+        # keep search from burning limits (Search API has its own throttles)
+        cap_prs = min(cap_prs, 400)
+        pr_numbers = search_merged_pr_numbers(days=days, cap=cap_prs, token=token)
+
+        # slice based on GraphQL budget so high cap doesn't cause secondary rate limit
+        rl = graphql_rate_limit(token)
+        remaining = rl.get("remaining", 0)
+        max_prs = 250 if remaining > 1000 else 120 if remaining > 400 else 60
+        pr_numbers = pr_numbers[:max_prs]
+
+        prs = fetch_pr_details(pr_numbers, token=token, token_present=token_present)  # GraphQL path
+    else:
+        # REST-only limited mode: list endpoint, cap 50 to avoid anonymous limit
+        prs = fetch_recent_merged_prs_rest(days=int(days), cap=min(50, int(cap_prs)), token=token)
+
     pr_df = build_pr_df(prs)
     eng_df = compute_engineer_df(pr_df)
     return pr_df, eng_df
+
+
+@st.cache_data(show_spinner=False, ttl=60 * 30)
+def load_cached(days: int, cap_prs: int) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Cached only for limited mode (no token). Token mode uses _load() so cache stays predictable."""
+    return _load(days, cap_prs, "", False)
 
 
 # -----------------------------
@@ -310,47 +430,95 @@ def main():
             help="Use a fine-grained token with read access to public repositories.",
         ).strip()
 
-        if token:
-            os.environ["GITHUB_TOKEN"] = token
+        token_provided = bool(token)
+        st.caption(f"Token provided: {token_provided}")
+
+        if st.button("Test token"):
+            if not token:
+                st.warning("Paste a token first.")
+            else:
+                try:
+                    me = graphql("query { viewer { login } rateLimit { remaining } }", {}, token=token)
+                    login = me["data"]["viewer"]["login"]
+                    remaining = me["data"]["rateLimit"]["remaining"]
+                    st.success(f"Token works. viewer={login}, remaining={remaining}")
+                except Exception as e:
+                    st.error(f"Token test failed: {e}")
+
+        if st.button("Test REST token"):
+            try:
+                data = rest_get("https://api.github.com/rate_limit", token=token)
+                core = data["resources"]["core"]
+                st.success(f"REST ok. remaining={core['remaining']} reset={core['reset']}")
+            except Exception as e:
+                st.error(f"REST test failed: {e}")
+
+        if st.button("Show current rate limit"):
+            try:
+                data = rest_get("https://api.github.com/rate_limit", token=token)
+                core = data["resources"]["core"]
+                reset_dt = dt.datetime.fromtimestamp(core["reset"])
+                st.info(f"Core remaining={core['remaining']} resets_at={reset_dt} (local machine time)")
+            except Exception as e:
+                st.error(f"Rate limit check failed: {e}")
+
+        if not token_provided:
+            st.warning("Running in limited mode (no GitHub token): using REST-only and a small sample (up to 50 PRs). Paste a token for full results.")
 
         st.divider()
         st.subheader("Scope")
-        days = st.number_input("Lookback (days)", min_value=14, max_value=365, value=DEFAULT_DAYS, step=7)
-        cap_prs = st.number_input("Max merged PRs", min_value=50, max_value=2000, value=DEFAULT_CAP_PRS, step=50)
+        safe_default_days = 30 if not token_provided else DEFAULT_DAYS
+        safe_default_cap = 50 if not token_provided else DEFAULT_CAP_PRS
+        days = st.number_input("Lookback (days)", min_value=14, max_value=365, value=safe_default_days, step=7)
+        cap_prs = st.number_input("Max merged PRs", min_value=50, max_value=2000, value=safe_default_cap, step=25)
 
         st.divider()
         st.subheader("Metrics")
-        include_leverage = st.toggle("Include Leverage (changed files)", value=True)
+        if token_provided:
+            include_leverage = st.toggle("Include Leverage (changed files)", value=True)
+        else:
+            include_leverage = False  # limited mode: cycle time only
 
         st.divider()
         st.subheader("Weights (auto-normalized)")
-        # Defaults: 4-metric composite (or 3 if leverage disabled)
-        w_delivery = st.slider("Delivery (log lines)", 0.0, 1.0, 0.40, 0.05)
-        w_reviews  = st.slider("Reviews written",     0.0, 1.0, 0.25, 0.05)
-        w_cycle    = st.slider("Cycle time (faster)", 0.0, 1.0, 0.20, 0.05)
-        w_leverage = st.slider("Leverage (log files)",0.0, 1.0, 0.15, 0.05) if include_leverage else 0.0
+        if token_provided:
+            w_delivery = st.slider("Delivery (log lines)", 0.0, 1.0, 0.40, 0.05)
+            w_reviews  = st.slider("Reviews written",     0.0, 1.0, 0.25, 0.05)
+            w_cycle    = st.slider("Cycle time (faster)", 0.0, 1.0, 0.20, 0.05)
+            w_leverage = st.slider("Leverage (log files)",0.0, 1.0, 0.15, 0.05) if include_leverage else 0.0
+            w_sum = w_delivery + w_reviews + w_cycle + (w_leverage if include_leverage else 0.0)
+            if w_sum == 0:
+                w_sum = 1.0
+            weights = {
+                "delivery": w_delivery / w_sum,
+                "reviews": w_reviews / w_sum,
+                "cycle": w_cycle / w_sum,
+                "leverage": (w_leverage / w_sum) if include_leverage else 0.0,
+            }
+        else:
+            st.caption("Limited mode: cycle time only.")
+            weights = {"delivery": 0.0, "reviews": 0.0, "cycle": 1.0, "leverage": 0.0}
 
-        w_sum = w_delivery + w_reviews + w_cycle + (w_leverage if include_leverage else 0.0)
-        if w_sum == 0:
-            w_sum = 1.0
-
-        weights = {
-            "delivery": w_delivery / w_sum,
-            "reviews": w_reviews / w_sum,
-            "cycle": w_cycle / w_sum,
-            "leverage": (w_leverage / w_sum) if include_leverage else 0.0,
-        }
         st.caption(f"Normalized weights: {weights}")
 
         st.divider()
-        if not os.getenv("GITHUB_TOKEN", "").strip():
-            st.warning("Set GITHUB_TOKEN for higher rate limits. Without it, fetch may be slow or capped.")
+        if not token_provided:
+            st.caption("Tip: Add a GitHub token to increase rate limits and fetch more PRs.")
 
     with st.spinner("Fetching merged PRs + reviews and computing scores..."):
-        pr_df, eng_df = load(days=int(days), cap_prs=int(cap_prs))
+        if token_provided:
+            pr_df, eng_df = _load(int(days), int(cap_prs), token, True)
+        else:
+            pr_df, eng_df = load_cached(int(days), int(cap_prs))
         if pr_df.empty or eng_df.empty:
             st.error("No PR data returned. Double-check your GITHUB_TOKEN and try a smaller cap (e.g., 150) or window (e.g., 30 days).")
             st.stop()
+
+    if not token_provided:
+        st.info(
+            "Limited mode: metrics below are based on cycle time and PR count only. "
+            "Delivery, reviews, and leverage are empty. Add a token for full metrics."
+        )
 
     scored = apply_weights(eng_df, weights, include_leverage=include_leverage)
 
@@ -407,8 +575,11 @@ def main():
 
     # Optional: quick PR drilldown (still PR-only)
     with st.expander("Show merged PRs for selected engineer (latest 25)"):
-        prs_for = pr_df[pr_df["author"] == engineer].sort_values("merged_at", ascending=False)
-        prs_for = prs_for[["number", "title", "lines_changed", "changed_files", "merge_hours", "url"]].head(25)
+        prs_for = pr_df[pr_df["author"] == engineer].sort_values("merged_at", ascending=False).head(25)
+        if token_provided:
+            prs_for = prs_for[["number", "title", "lines_changed", "changed_files", "merge_hours", "url"]]
+        else:
+            prs_for = prs_for[["number", "title", "merge_hours", "url"]]
         st.dataframe(prs_for, use_container_width=True, hide_index=True)
 
     st.caption(
