@@ -1,8 +1,8 @@
-📊 PostHog Engineering Impact Dashboard (PR-Only MVP)
+PostHog Engineering Impact Dashboard (PR-Only MVP)
 A lightweight, rate-limit-aware Streamlit dashboard that analyzes GitHub PR metadata to surface multi-dimensional engineering impact signals.
-⚠️ This is a decision-support tool, not a performance ranking system.
+This is a decision-support tool, not a performance ranking system.
 
-🎯 Goal
+Goal
 Given a strict time constraint, the goal was to:
 * Define a defensible model of engineering impact
 * Use only observable GitHub PR metadata
@@ -10,7 +10,7 @@ Given a strict time constraint, the goal was to:
 * Build a clean, interactive dashboard for engineering leadership
 This MVP focuses exclusively on PR-level signals and intentionally excludes incident linkage, NLP classification, and identity reconciliation.
 
-🧠 How “Impact” Is Defined
+How “Impact” Is Defined
 Engineering impact is modeled as a weighted composite of observable PR signals:
 1️⃣ Delivery (log-scaled output)
 * Sum of log(1 + additions + deletions)
@@ -29,7 +29,7 @@ Engineering impact is modeled as a weighted composite of observable PR signals:
 * Proxy for cross-cutting/system-wide changes
 Each metric is min-max normalized across engineers and combined via adjustable weights.
 
-⚖️ Composite Score
+omposite Score
 
 Impact Score =
   w_delivery * delivery_n
@@ -38,7 +38,7 @@ Impact Score =
 + w_leverage * leverage_n
 Weights are configurable in the UI and auto-normalized.
 
-🔒 Scope Constraints (Intentional)
+Scope Constraints (Intentional)
 This MVP explicitly excludes:
 * ❌ Incident or revert linkage
 * ❌ Bug attribution
@@ -54,7 +54,7 @@ Given the time constraint, the focus was on:
 * Interpretability
 * Reliability under API rate limits
 
-🛠 Architecture Overview
+Architecture Overview
 Data Sources
 * GitHub Search API → merged PR numbers
 * GitHub GraphQL API → PR metadata + reviews
@@ -65,7 +65,7 @@ Rate Limit Strategy
 * Hard cap on PR volume
 * REST-only limited mode if no token provided
 
-🚀 Running the App
+Running the App
 1️⃣ Install dependencies
 
 pip install -r requirements.txt
@@ -79,13 +79,13 @@ Without a token:
 * Up to 50 PRs
 * Cycle-time-only scoring
 
-📦 requirements.txt
+requirements.txt
 
 streamlit>=1.31
 pandas>=2.0
 requests>=2.31
 
-📊 Dashboard Features
+Dashboard Features
 * Adjustable weight sliders
 * Top 5 engineers by composite score
 * Single breakdown visualization
@@ -93,7 +93,7 @@ requests>=2.31
 * Built-in rate limit diagnostics
 * REST fallback for limited mode
 
-🧩 Design Decisions
+Design Decisions
 * Log scaling prevents PR size gaming.
 * Median merge time reduces outlier distortion.
 * Review deduplication avoids counting multiple review states.
@@ -101,7 +101,7 @@ requests>=2.31
 * Activity floor logic reduces noise from extremely low-volume contributors.
 * PR-only scope maximizes reliability within time constraints.
 
-⚠️ Limitations
+Limitations
 This dashboard captures observable GitHub PR signals only.
 It does not measure:
 * Mentorship
@@ -113,7 +113,7 @@ It does not measure:
 Scores are heuristic and intended to:
 Surface signals and start conversations, not replace human judgment.
 
-🔮 Future Iterations
+Future Iterations
 If extended beyond MVP:
 * Incorporate revert/incident linkage
 * Normalize per active month (tenure bias reduction)
@@ -122,7 +122,7 @@ If extended beyond MVP:
 * Validate metrics against downstream outcomes
 * Add confidence intervals for stability analysis
 
-🏁 Final Note
+Final Note
 This MVP prioritizes:
 * Pragmatism over exhaustiveness
 * Interpretability over statistical sophistication
